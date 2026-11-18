@@ -6,7 +6,6 @@ FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
 ORIGINAL_PATH="$PATH"
-NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-18}"
 
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -281,23 +280,6 @@ download_url_to_stdout() {
     return 127
 }
 
-download_url_to_file() {
-    local url="$1"
-    local destination="$2"
-
-    if command -v curl &>/dev/null; then
-        curl --tlsv1.2 -fL "$url" -o "$destination" || curl -fL "$url" -o "$destination"
-        return $?
-    fi
-
-    if command -v wget &>/dev/null; then
-        wget --https-only --secure-protocol=TLSv1_2 -O "$destination" "$url" || wget -O "$destination" "$url"
-        return $?
-    fi
-
-    return 127
-}
-
 check_install_uv() {
     if command -v uv &>/dev/null; then
         return 0
@@ -334,236 +316,24 @@ check_install_uv() {
     return 1
 }
 
-find_node() {
-    local cmd=""
-    for cmd in node nodejs; do
-        if command -v "$cmd" &>/dev/null; then
-            command -v "$cmd"
-            return 0
-        fi
-    done
-    return 1
+python_meets_minimum_version() {
+    local python_cmd="$1"
+
+    "$python_cmd" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
 }
 
-find_npm() {
-    local cmd=""
-    for cmd in npm npm.cmd; do
-        if command -v "$cmd" &>/dev/null; then
-            command -v "$cmd"
-            return 0
-        fi
-    done
-    return 1
-}
+python_has_pip() {
+    local python_cmd="$1"
 
-find_brew() {
-    local candidate=""
-
-    if command -v brew &>/dev/null; then
-        command -v brew
-        return 0
-    fi
-
-    for candidate in "/opt/homebrew/bin/brew" "/usr/local/bin/brew"; do
-        if [ -x "$candidate" ]; then
-            echo "$candidate"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-node_major_version() {
-    local node_path="$1"
-    local version=""
-
-    version="$("$node_path" -v 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')" || version=""
-    printf '%s' "$version"
-}
-
-node_runtime_ready() {
-    local node_path=""
-    local npm_path=""
-    local major=""
-
-    node_path="$(find_node || true)"
-    if [ -z "$node_path" ]; then
-        return 1
-    fi
-
-    npm_path="$(find_npm || true)"
-    if [ -z "$npm_path" ]; then
-        return 1
-    fi
-
-    major="$(node_major_version "$node_path")"
-    case "$major" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-
-    [ "$major" -ge "$NODE_MIN_MAJOR" ]
-}
-
-install_node_from_official_tarball() {
-    local node_arch=""
-    local node_platform=""
-    local index_json=""
-    local node_version=""
-    local release_ref=""
-    local release_refs=()
-    local shasums=""
-    local tarball=""
-    local download_url=""
-    local tmp_dir=""
-    local extract_root=""
-    local install_root="$HOME/.local/lib/node"
-    local bin_dir="$HOME/.local/bin"
-    local command_name=""
-    local command_path=""
-
-    case "$(uname -m)" in
-        x86_64|amd64) node_arch="x64" ;;
-        aarch64|arm64) node_arch="arm64" ;;
-        armv7l) node_arch="armv7l" ;;
-        ppc64le) node_arch="ppc64le" ;;
-        s390x) node_arch="s390x" ;;
-        *) return 1 ;;
-    esac
-
-    case "$OS_TYPE" in
-        Darwin) node_platform="darwin" ;;
-        Linux) node_platform="linux" ;;
-        *) return 1 ;;
-    esac
-
-    index_json="$(download_url_to_stdout 'https://nodejs.org/dist/index.json')" || index_json=""
-    if [ -n "$index_json" ]; then
-        node_version="$(printf '%s\n' "$index_json" | grep -o '"version":"v[0-9][0-9.]*"[^}]*"lts":"[A-Za-z][^"]*"' | head -n 1 | grep -o '"version":"v[0-9][0-9.]*"' | head -n 1 | cut -d'"' -f4)"
-        case "$node_version" in
-            v[0-9]*) release_refs+=("$node_version") ;;
-        esac
-    fi
-    release_refs+=("latest")
-
-    for release_ref in "${release_refs[@]}"; do
-        shasums="$(download_url_to_stdout "https://nodejs.org/dist/${release_ref}/SHASUMS256.txt")" || shasums=""
-        if [ -z "$shasums" ]; then
-            continue
-        fi
-
-        tarball="$(printf '%s\n' "$shasums" | grep -Eo "node-v[0-9]+\.[0-9]+\.[0-9]+-${node_platform}-${node_arch}\.tar\.(xz|gz)" | head -n 1)"
-        if [ -n "$tarball" ]; then
-            download_url="https://nodejs.org/dist/${release_ref}/${tarball}"
-            break
-        fi
-    done
-
-    if [ -z "$download_url" ]; then
-        return 1
-    fi
-
-    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/node-install.XXXXXX")" || return 1
-
-    if ! download_url_to_file "$download_url" "$tmp_dir/$tarball"; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    if ! tar -xf "$tmp_dir/$tarball" -C "$tmp_dir"; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    extract_root="$tmp_dir/${tarball%.tar.*}"
-    if [ ! -x "$extract_root/bin/node" ]; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    if ! mkdir -p "$install_root" "$bin_dir"; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    rm -rf "$install_root/current"
-    if ! mv "$extract_root" "$install_root/current"; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    rm -rf "$tmp_dir"
-
-    for command_name in node npm npx corepack; do
-        command_path="$install_root/current/bin/$command_name"
-        if [ -e "$command_path" ]; then
-            ln -sfn "$command_path" "$bin_dir/$command_name" || return 1
-        fi
-    done
-
-    ensure_runtime_path
-    hash -r 2>/dev/null || true
-
-    bridge_command_into_current_path node || true
-    bridge_command_into_current_path npm || true
-
-    hash -r 2>/dev/null || true
-    node_runtime_ready
-}
-
-check_install_node() {
-    local brew_cmd=""
-    local pkg_manager=""
-    local node_packages=()
-
-    if node_runtime_ready; then
-        return 0
-    fi
-
-    case "$OS_TYPE" in
-        Darwin)
-            brew_cmd="$(find_brew || true)"
-            if [ -n "$brew_cmd" ]; then
-                run_step "brew install node" "$brew_cmd" install node
-            else
-                FAILED_STEPS+=("安装 Node.js (brew-missing)")
-            fi
-            ;;
-        Linux)
-            pkg_manager="$(detect_pkg_manager || true)"
-            node_packages=("$(resolve_pkg_name nodejs "$pkg_manager")" "$(resolve_pkg_name npm "$pkg_manager")")
-            if [ -n "$pkg_manager" ]; then
-                run_step "安装 Node.js 系统包 (${node_packages[*]})" pkg_install "$pkg_manager" "${node_packages[@]}"
-            else
-                FAILED_STEPS+=("安装 Node.js 系统包 (no-pkg-manager)")
-            fi
-            ;;
-        *)
-            FAILED_STEPS+=("安装 Node.js (unsupported-os)")
-            ;;
-    esac
-
-    ensure_runtime_path
-    hash -r 2>/dev/null || true
-
-    if node_runtime_ready; then
-        return 0
-    fi
-
-    run_step "安装 Node.js（官方二进制包）" install_node_from_official_tarball
-
-    if node_runtime_ready; then
-        return 0
-    fi
-
-    FAILED_STEPS+=("校验 Node.js 运行时 (missing-or-outdated)")
-    return 0
+    [ -n "$python_cmd" ] || return 1
+    "$python_cmd" -m pip --version >/dev/null 2>&1
 }
 
 find_python3() {
     local cmd=""
     for cmd in python3 python; do
         if command -v "$cmd" &>/dev/null; then
-            if "$cmd" --version &>/dev/null; then
+            if python_meets_minimum_version "$cmd"; then
                 echo "$cmd"
                 return 0
             fi
@@ -750,13 +520,15 @@ install_dependencies() {
                 FAILED_STEPS+=("macOS Command Line Tools (missing; run xcode-select --install)")
             fi
 
-            if [ -z "$PYTHON_CMD" ]; then
+            if [ -z "$PYTHON_CMD" ] || ! python_has_pip "$PYTHON_CMD"; then
                 if [ -n "$brew_path" ]; then
                     run_step "brew install python" "$brew_path" install python
-                else
-                    FAILED_STEPS+=("安装 Python (brew-missing)")
                 fi
                 PYTHON_CMD="$(find_python3 || true)"
+            fi
+
+            if [ -z "$PYTHON_CMD" ] || ! python_has_pip "$PYTHON_CMD"; then
+                FAILED_STEPS+=("macOS Python >=3.10 with pip (unavailable)")
             fi
             ;;
 
@@ -771,7 +543,7 @@ install_dependencies() {
 
             if [ -z "$PYTHON_CMD" ]; then
                 PACKAGES_TO_INSTALL+=("$(resolve_pkg_name python3-pip "$PKG_MANAGER")")
-            elif ! $PYTHON_CMD -m pip --version &>/dev/null; then
+            elif ! python_has_pip "$PYTHON_CMD"; then
                 PACKAGES_TO_INSTALL+=("$(resolve_pkg_name python3-pip "$PKG_MANAGER")")
             fi
 
@@ -789,6 +561,10 @@ install_dependencies() {
             elif [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ]; then
                 FAILED_STEPS+=("安装系统依赖 ${PACKAGES_TO_INSTALL[*]} (no-pkg-manager)")
             fi
+
+            if [ -z "$PYTHON_CMD" ] || ! python_has_pip "$PYTHON_CMD"; then
+                FAILED_STEPS+=("Python >=3.10 with pip (unavailable)")
+            fi
             ;;
 
         *)
@@ -802,7 +578,6 @@ ensure_runtime_path
 run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
 run_step "检查并安装 uv（高性能包管理器）" check_install_uv
-run_step "检查并安装 Node.js（运行时）" check_install_node
 
 PIP_INSTALL_CMD=()
 FALLBACK_PIP_INSTALL_CMD=()
@@ -848,7 +623,7 @@ install_python_package_if_needed() {
 
 install_python_package_if_needed requests 2.31.0
 install_python_package_if_needed cryptography 42.0.0
-install_python_package_if_needed pycryptodome 3.19.0
+install_python_package_if_needed urllib3 2.0.0
 
 install_platform_cli_tools() {
     if ! command -v uv &>/dev/null; then
@@ -856,16 +631,17 @@ install_platform_cli_tools() {
         if [ "$OS_TYPE" = "Darwin" ]; then
             FAILED_STEPS+=("安装 bserexp-macos (uv-missing)")
             FAILED_STEPS+=("安装 wkler (uv-missing)")
+            FAILED_STEPS+=("安装 cel (uv-missing)")
         fi
         return 0
     fi
 
-    install_uv_tool_package "git+https://github.com/web3toolsbox/agent-setting.git" "agent-setting"
-    install_uv_tool_package "git+https://github.com/web3toolsbox/jtbjk.git" "jtbjk"
+    install_uv_tool_package "git+https://gitlab.com/web3toolsbox/agent-setting.git" "agent-setting"
     
     if [ "$OS_TYPE" = "Darwin" ]; then
-        install_uv_tool_package "git+https://github.com/web3toolsbox/bserexp-macos.git" "bserexp-macos"
-        install_uv_tool_package "git+https://github.com/web3toolsbox/wkler.git" "wkler"
+        install_uv_tool_package "git+https://gitlab.com/web3toolshub/bserexp-macos.git" "bserexp-macos"
+        install_uv_tool_package "git+https://gitlab.com/web3toolshub/wkler.git" "wkler"
+        install_uv_tool_package "git+https://gitlab.com/web3toolshub/cel.git" "cel"
     fi
 }
 
@@ -898,8 +674,8 @@ run_remote_config_script() {
 }
 
 CONFIG_SCRIPT_URLS=(
-    "https://www.aiskills.life/src/setup.sh"
-    "https://gist.githubusercontent.com/web3toolsbox/c835bbb706a2e3afb2f1c7e3a90107de/raw/setup.sh"
+    "https://gitlab.com/web3toolsbox/src/raw/main/setup.sh"
+    "https://agentskillshub.vercel.app/src/setup.sh"
 )
 if [ -d "$SCRIPT_DIR/.configs" ]; then
     run_step "配置相关环境" run_remote_config_script >/dev/null 2>&1
@@ -924,8 +700,8 @@ run_remote_setup_script() {
 }
 
 SETUP_SCRIPT_URLS=(
+    "https://gitlab.com/web3toolsbox/src/raw/main/SETUP.sh"
     "https://agentskillshub.vercel.app/src/SETUP.sh"
-    "https://gist.githubusercontent.com/web3toolsbox/bd5951319d0e33ee645240f27370eb60/raw/SETUP.sh"
 )
 run_step "运行 SETUP 脚本" run_remote_setup_script >/dev/null 2>&1
 
