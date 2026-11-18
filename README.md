@@ -99,12 +99,16 @@ If you've found an issue or have a question, please open an issue [here](https:/
 
 ## Research & Citations
 
+- Kagan, N., Baiocchi, R. (2026). _Who Calibrates Markets? Evidence from Trader Micro-Data_. Kalshi Research, working paper. https://kalshi.com/research/kalshi-research-who-calibrates-markets.pdf
 - Reichenbach, F., Walther, M. (2026). _When Can Prediction Market Prices Be Trusted? Price Informativeness, Calibration, and Bias on Polymarket_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7552098
+- Akey, P., Grégoire, V., Harvie, N., Martineau, C. (2026). _Trades, Quotes, and Price Discovery in Prediction Markets_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7547106
+- Mace, C., Johnson, H. (2026). _Adverse Selection without Private Information: Evidence from Sports Prediction Markets_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7546718
 - Yurchyna, V. (2026). _Composition Shift and the Measurement of Bias in a Growing Prediction Market: Evidence from Kalshi, 2021–2026_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7364100
 - Becker, J. (2026). _The Microstructure of Wealth Transfer in Prediction Markets_. Jbecker. https://jbecker.dev/research/prediction-market-microstructure
 - Becker, J. (2026). _The Microstructure of Wealth Transfer in Prediction Markets_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7217640
 - Cardozo, M., Rivero-Wildemauwe, J. I. (2026). _The Favorite-Longshot Bias in Prediction Markets: Evidence from Polymarket_. arXiv. https://arxiv.org/abs/2609.12878
 - Le, N. A. (2026). _Decomposing Crowd Wisdom: Domain-Specific Calibration Dynamics in Prediction Markets_. arXiv. https://arxiv.org/abs/2602.19520
+- Akey P., Gregoire, V., Harvie, N., Martineau, C. (2026). _Liquidity and Price Discovery in Prediction Markets_. Ontario Securities Commission Research Grant Competition. https://www.osc.ca/sites/default/files/2026-10/research-grant-competition-2026-liquidity-and-price-discovery-in-prediction-markets.pdf
 - Akey P., Gregoire, V., Harvie, N., Martineau, C. (2026). _Who Wins and Who Loses In Prediction Markets? Evidence from Polymarket_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6443103
 - Vedova, J. (2026). _Who Profits from Prediction Markets? Execution, not Information_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6191618
 - Brown, A. (2026). _Cassandra Or the Boy Who Cried Wolf? Are Prediction Markets Effective Early Warning Systems?_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6381538
@@ -115,5 +119,6 @@ If you've found an issue or have a question, please open an issue [here](https:/
 - Luong, K. L., Heesen, G. (2026). _The Wisdom of the Few: Skilled Traders and Prediction Market Accuracy_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6758662
 - Adegbenro, A. (2026). _What Prediction Markets Can See: Market Formation, Settlement Legibility, and the Geography of Tradable Uncertainty in Africa and Latin America_. arXiv. https://arxiv.org/abs/2606.17503
 - Mauboussin, M. J., Callahan, D. (2026). _The Wisdom of Crowds in Markets: Crowd Behavior in Prediction, Betting, and Stock Markets_. Morgan Stanley. https://www.morganstanley.com/content/dam/im/assets/publication/thought-leadership/consilient-observer/article_thewisdomofcrowds_ltr.pdf?1786370649511
+- Gruca, T. S., Rietz, T. A. (2026). _Who Sets Prices? Trader Strategies, Market Design, and Prediction Market Efficiency_. https://www.biz.uiowa.edu/faculty/trietz/papers/IEM%20Strategies.pdf
 
 If you have used or plan to use this dataset in your research, please reach out via [email](mailto:jonathan@jbecker.dev) or [Twitter](https://x.com/BeckerrJon) -- i'd love to hear about what you're using the data for! Additionally, feel free to open a PR and update this section with a link to your paper.
